@@ -1,14 +1,18 @@
 import { useEffect, useMemo, useState } from 'react';
-import { App as AntApp, Badge, Button, Card, Col, Descriptions, Empty, Form, Input, Layout, List, Menu, Row, Select, Space, Statistic, Table, Tag, Timeline, Typography, message } from 'antd';
-import { ClockCircleOutlined, FlagOutlined, PlusOutlined, SafetyCertificateOutlined } from '@ant-design/icons';
+import { App as AntApp, Alert, Badge, Button, Card, Col, Descriptions, Empty, Form, Input, Layout, List, Menu, Row, Select, Space, Statistic, Table, Tag, Timeline, Typography, message } from 'antd';
+import { ClockCircleOutlined, FlagOutlined, PlusOutlined, ReloadOutlined, SafetyCertificateOutlined, ThunderboltOutlined, WarningOutlined } from '@ant-design/icons';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { useForm } from 'react-hook-form';
 import { useTranslation } from 'react-i18next';
 import { useDispatch, useSelector } from 'react-redux';
 import { BrowserRouter, Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom';
 import { z } from 'zod';
-import { addProtest, saveResult, setRaceStatus, transitionProtest, type AppDispatch, type RootState } from './store';
-import { useGetOfficialsQuery } from './api';
+import {
+  addProtest, clearConflict, clearNotice, clearOutboxItem, publishRace, registerCertificate,
+  registerWeight, retryRegistration, runInspection, saveResult, setCurrentOfficial, setRaceStatus,
+  transitionProtest, selectRanking, type AppDispatch, type RootState
+} from './store';
+import { useGetOfficialsQuery, OFFICIALS, isMeasurer } from './api';
 import type { RaceEntry } from './types';
 
 const { Header, Content, Sider } = Layout;
@@ -30,14 +34,17 @@ function countdown(target: string, now: number) {
   return `${String(Math.floor(seconds / 60)).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}`;
 }
 
+function RaceStatusTag({ status }: { status: RaceEntry['resultStatus'] }) {
+  return <Tag color={status === 'official' ? 'green' : status === 'corrected' ? 'orange' : 'default'}>{status}</Tag>;
+}
+
 function ControlPage() {
   const { t } = useTranslation();
   const dispatch = useDispatch<AppDispatch>();
   const race = useSelector((state: RootState) => state.regatta.races[0]);
-  const entries = useSelector((state: RootState) => state.regatta.entries);
+  const { ranked, pending } = useSelector(selectRanking);
   const [now, setNow] = useState(Date.now());
   useEffect(() => { const timer = window.setInterval(() => setNow(Date.now()), 1000); return () => window.clearInterval(timer); }, []);
-  const sorted = useMemo(() => [...entries].sort((a, b) => a.elapsedSeconds + a.penaltySeconds - b.elapsedSeconds - b.penaltySeconds), [entries]);
 
   return (
     <Space direction="vertical" size="large" style={{ width: '100%' }}>
@@ -58,15 +65,22 @@ function ControlPage() {
           </Card>
         </Col>
         <Col xs={24} lg={14}>
-          <Card title={t('control')} extra={<Tag color="blue">{sorted.length} 艘参赛船</Tag>}>
-            <Table rowKey="id" pagination={false} dataSource={sorted} columns={[
-              { title: '排名', render: (_v, _r, index) => index + 1, width: 64 },
-              { title: '船名', dataIndex: 'boat' },
-              { title: '帆号', dataIndex: 'sailNo' },
-              { title: '船长', dataIndex: 'skipper' },
-              { title: '当前净用时', render: (_v, r: RaceEntry) => `${r.elapsedSeconds + r.penaltySeconds}s` },
-              { title: '状态', render: (_v, r: RaceEntry) => <Tag color={r.resultStatus === 'official' ? 'green' : r.resultStatus === 'corrected' ? 'orange' : 'default'}>{r.resultStatus}</Tag> }
+          <Card title={t('control')} extra={<Space><Tag color="green">{ranked.length} 艘确认占名次</Tag><Tag color="default">{pending.length} 艘待核</Tag><Button size="small" icon={<SafetyCertificateOutlined />} onClick={() => dispatch(runInspection())}>赛前核对放行资格</Button></Space>}>
+            <Table rowKey="id" pagination={false} dataSource={ranked} columns={[
+              { title: '名次', render: (_v, _r, index) => index + 1, width: 64 },
+              { title: '船名', dataIndex: ['entry', 'boat'] },
+              { title: '帆号', dataIndex: ['entry', 'sailNo'] },
+              { title: '船长', dataIndex: ['entry', 'skipper'] },
+              { title: '总用时', render: (_v, r) => `${r.total}s` },
+              { title: '证书/重量', render: (_v, r) => <Space size={4}>{r.snap?.certValid ? <Tag color="green">证书有效</Tag> : <Tag>无证书</Tag>}{r.snap?.weightOk ? <Tag color="green">{r.snap.weightKg}kg</Tag> : <Tag color="red">{r.snap?.weightKg ?? '—'}kg 超限</Tag>}</Space> }
             ]} />
+            {pending.length > 0 && (
+              <Alert style={{ marginTop: 16 }} type="warning" showIcon icon={<WarningOutlined />} message="待核船（不占正式名次）" description={
+                <List size="small" dataSource={pending} renderItem={(r) => (
+                  <List.Item><Space><Tag>{r.entry.sailNo}</Tag><span>{r.entry.boat}</span><Tag color="red">{r.reason}</Tag></Space></List.Item>
+                )} />
+              } />
+            )}
           </Card>
         </Col>
       </Row>
@@ -77,6 +91,9 @@ function ControlPage() {
 function ResultsPage() {
   const dispatch = useDispatch<AppDispatch>();
   const entries = useSelector((state: RootState) => state.regatta.entries);
+  const race = useSelector((state: RootState) => state.regatta.races[0]);
+  const versions = useSelector((state: RootState) => state.regatta.resultVersions);
+  const { ranked, pending } = useSelector(selectRanking);
   const [api, contextHolder] = message.useMessage();
   const { register, handleSubmit, reset, formState: { errors } } = useForm<z.infer<typeof resultSchema>>({
     resolver: zodResolver(resultSchema),
@@ -87,6 +104,7 @@ function ResultsPage() {
     api.success('成绩已更正并进入待发布状态');
     reset();
   };
+  const raceVersions = versions.filter((v) => v.raceId === race.id).sort((a, b) => a.version - b.version);
   return (
     <>
       {contextHolder}
@@ -105,19 +123,128 @@ function ResultsPage() {
           </Card>
         </Col>
         <Col xs={24} lg={14}>
-          <Card title="临时与正式成绩">
-            <List dataSource={entries} renderItem={(entry) => (
-              <List.Item actions={[
-                <Button key="publish" size="small" type="link" onClick={() => dispatch(saveResult({ id: entry.id, elapsedSeconds: entry.elapsedSeconds, penaltySeconds: entry.penaltySeconds, note: entry.note, official: true }))}>发布正式</Button>
-              ]}>
-                <List.Item.Meta title={`${entry.boat} · ${entry.elapsedSeconds + entry.penaltySeconds} 秒`} description={entry.note || '无更正说明'} />
-                <Tag color={entry.resultStatus === 'official' ? 'green' : 'orange'}>{entry.resultStatus}</Tag>
-              </List.Item>
+          <Card title="临时与正式成绩" extra={<Button type="primary" icon={<SafetyCertificateOutlined />} onClick={() => dispatch(publishRace({ raceId: race.id }))}>发布正式名次</Button>}>
+            <List size="small" header={<b>确认船（占名次）</b>} dataSource={ranked} renderItem={(r) => (
+              <List.Item><List.Item.Meta title={`${r.rank}. ${r.entry.boat} · ${r.total} 秒`} description={r.entry.note || '无更正说明'} /><RaceStatusTag status={r.entry.resultStatus} /></List.Item>
             )} />
+            {pending.length > 0 && <List size="small" header={<b>待核船（不占名次）</b>} dataSource={pending} renderItem={(r) => (
+              <List.Item><List.Item.Meta title={`${r.entry.boat} · ${r.total} 秒`} description={<Tag color="red">{r.reason}</Tag>} /><Tag>待核</Tag></List.Item>
+            )} />}
+          </Card>
+          <Card title="成绩版本（已发布另存更正版）" style={{ marginTop: 18 }}>
+            {raceVersions.length === 0 ? <Empty description="尚未发布正式成绩" /> : raceVersions.map((v) => (
+              <Card key={v.id} size="small" type="inner" style={{ marginBottom: 12 }} title={<Space><Tag color={v.type === 'official' ? 'green' : 'orange'}>{v.type === 'official' ? '正式' : '更正（作废留档）'}</Tag><span>v{v.version}</span></Space>} extra={<small>{new Date(v.publishedAt).toLocaleString()}</small>}>
+                <Table size="small" rowKey="entryId" pagination={false} dataSource={v.rows} columns={[
+                  { title: '名次', render: (_v, r) => r.rank ?? '—', width: 64 },
+                  { title: '船名', dataIndex: 'boat' },
+                  { title: '总用时', dataIndex: 'totalSeconds', render: (v: number) => `${v}s` },
+                  { title: '状态', render: (_v, r) => <RaceStatusTag status={r.status} /> }
+                ]} />
+              </Card>
+            ))}
           </Card>
         </Col>
       </Row>
     </>
+  );
+}
+
+function MeasurementPage() {
+  const dispatch = useDispatch<AppDispatch>();
+  const entries = useSelector((state: RootState) => state.regatta.entries);
+  const measurements = useSelector((state: RootState) => state.regatta.measurements);
+  const outbox = useSelector((state: RootState) => state.regatta.outbox);
+  const lastConflict = useSelector((state: RootState) => state.regatta.lastConflict);
+  const currentOfficialId = useSelector((state: RootState) => state.regatta.currentOfficialId);
+  const weightLimitKg = useSelector((state: RootState) => state.regatta.weightLimitKg);
+  const me = OFFICIALS.find((o) => o.id === currentOfficialId);
+  const measurer = isMeasurer(currentOfficialId);
+  const uniqueSailNos = useMemo(() => Array.from(new Set(entries.map((e) => e.sailNo))), [entries]);
+  const [sailNo, setSailNo] = useState(uniqueSailNos[0] ?? '');
+  const [weightKg, setWeightKg] = useState(80);
+  const [staleVersion, setStaleVersion] = useState(false);
+  const [simulateFailure, setSimulateFailure] = useState(false);
+  const [certForm, setCertForm] = useState({ number: '', issuedBy: '中国帆协', validFrom: '2026-01-01', validTo: '2026-12-31' });
+
+  const record = measurements[sailNo];
+  const latest = record?.weightReadings[record.weightReadings.length - 1];
+  const conflict = lastConflict && lastConflict.sailNo === sailNo ? lastConflict : null;
+
+  const submitWeight = () => {
+    dispatch(registerWeight({ sailNo, weightKg, expectedVersion: record?.currentVersion ?? 0, staleVersion, simulateFailure }));
+    setSimulateFailure(false);
+  };
+  const submitCert = () => {
+    dispatch(registerCertificate({ sailNo, ...certForm, simulateFailure }));
+    setSimulateFailure(false);
+  };
+
+  return (
+    <Space direction="vertical" size="large" style={{ width: '100%' }}>
+      <Alert type="info" showIcon message={<Space><span>当前身份：</span><Tag>{me?.name}</Tag><Tag color={measurer ? 'green' : 'red'}>{me?.role}</Tag>{!measurer && <span>非丈量员登记将被挡回</span>}</Space>} />
+      {!measurer && <Alert type="error" showIcon icon={<WarningOutlined />} message="越权警告：当前身份不是丈量员，称重与证书登记已禁用，提交会被挡回" />}
+      {conflict && (
+        <Alert type="warning" showIcon icon={<ThunderboltOutlined />} message={`检测到并发提交冲突（冲突号 ${conflict.conflictNo}）`} description={
+          <Space direction="vertical">
+            <span>您基于 v{conflict.expectedVersion} 提交，先写入的已生效至 v{conflict.currentVersion}。当前读数：<b>{conflict.currentWeightKg ?? '—'}kg</b>。请核对后基于 v{conflict.currentVersion} 重新提交。</span>
+            <Button size="small" onClick={() => dispatch(clearConflict())}>知道了</Button>
+          </Space>
+        } />
+      )}
+      <Row gutter={[18, 18]}>
+        <Col xs={24} lg={10}>
+          <Card title="丈量登记">
+            <Space direction="vertical" style={{ width: '100%' }}>
+              <Select value={sailNo} onChange={setSailNo} style={{ width: '100%' }} options={uniqueSailNos.map((s) => ({ value: s, label: s }))} />
+              <Descriptions column={1} size="small" bordered>
+                <Descriptions.Item label="证书">{record?.certificate ? <Tag color="green">{record.certificate.number}（{record.certificate.validFrom} ~ {record.certificate.validTo}）</Tag> : <Tag color="red">无证书</Tag>}</Descriptions.Item>
+                <Descriptions.Item label="最近称重">{latest ? <Space><Tag>{latest.weightKg}kg</Tag><Tag>v{latest.version}</Tag><small>{new Date(latest.weighedAt).toLocaleString()}</small></Space> : <Tag>暂无</Tag>}</Descriptions.Item>
+                <Descriptions.Item label="重量上限">{weightLimitKg}kg</Descriptions.Item>
+              </Descriptions>
+              <Card size="small" type="inner" title="称重登记">
+                <Space direction="vertical" style={{ width: '100%' }}>
+                  <Input addonAfter="kg" type="number" value={weightKg} onChange={(e) => setWeightKg(Number(e.target.value))} />
+                  <Space><input id="stale" type="checkbox" checked={staleVersion} onChange={(e) => setStaleVersion(e.target.checked)} /><label htmlFor="stale">模拟对方先提交（使用过期版本，触发冲突）</label></Space>
+                  <Space><input id="fail" type="checkbox" checked={simulateFailure} onChange={(e) => setSimulateFailure(e.target.checked)} /><label htmlFor="fail">模拟写入失败（登记留住待重试）</label></Space>
+                  <Button type="primary" icon={<PlusOutlined />} disabled={!measurer} onClick={submitWeight}>提交称重</Button>
+                </Space>
+              </Card>
+              <Card size="small" type="inner" title="证书登记">
+                <Space direction="vertical" style={{ width: '100%' }}>
+                  <Input placeholder="证书编号" value={certForm.number} onChange={(e) => setCertForm({ ...certForm, number: e.target.value })} />
+                  <Input placeholder="签发机构" value={certForm.issuedBy} onChange={(e) => setCertForm({ ...certForm, issuedBy: e.target.value })} />
+                  <Space><Input type="date" value={certForm.validFrom} onChange={(e) => setCertForm({ ...certForm, validFrom: e.target.value })} /><Input type="date" value={certForm.validTo} onChange={(e) => setCertForm({ ...certForm, validTo: e.target.value })} /></Space>
+                  <Button icon={<SafetyCertificateOutlined />} disabled={!measurer} onClick={submitCert}>提交证书</Button>
+                </Space>
+              </Card>
+            </Space>
+          </Card>
+        </Col>
+        <Col xs={24} lg={14}>
+          <Card title="待重试登记（写入失败未落地）" extra={<Tag>{outbox.length} 条</Tag>}>
+            {outbox.length === 0 ? <Empty description="无待重试登记" /> : (
+              <List dataSource={outbox} renderItem={(item) => (
+                <List.Item actions={[
+                  <Button key="retry" size="small" type="primary" icon={<ReloadOutlined />} onClick={() => dispatch(retryRegistration({ id: item.id }))}>重试</Button>,
+                  <Button key="drop" size="small" onClick={() => dispatch(clearOutboxItem({ id: item.id }))}>丢弃</Button>
+                ]}>
+                  <List.Item.Meta title={<Space><Tag color="orange">{item.kind === 'weight' ? '称重' : '证书'}</Tag><span>{item.sailNo}</span><small>重试 {item.retries} 次</small></Space>} description={<><div>{item.kind === 'weight' ? `${item.payload.weightKg}kg` : String(item.payload.number)}</div><small>{item.lastError}</small></>} />
+                </List.Item>
+              )} />
+            )}
+          </Card>
+          <Card title="丈量记录" style={{ marginTop: 18 }}>
+            {!record ? <Empty description="暂无丈量记录" /> : (
+              <Space direction="vertical" style={{ width: '100%' }}>
+                {record.weightReadings.slice().reverse().map((r) => (
+                  <List.Item key={r.id}><List.Item.Meta title={<Space><Tag>{r.weightKg}kg</Tag><Tag color="blue">v{r.version}</Tag><small>{new Date(r.weighedAt).toLocaleString()}</small></Space>} description={`${r.measurerName}（${r.measurerId}）`} /></List.Item>
+                ))}
+              </Space>
+            )}
+          </Card>
+        </Col>
+      </Row>
+    </Space>
   );
 }
 
@@ -173,29 +300,46 @@ function Shell() {
   const { t, i18n } = useTranslation();
   const navigate = useNavigate();
   const location = useLocation();
+  const dispatch = useDispatch<AppDispatch>();
   const { data = [] } = useGetOfficialsQuery();
+  const currentOfficialId = useSelector((state: RootState) => state.regatta.currentOfficialId);
+  const lastNotice = useSelector((state: RootState) => state.regatta.lastNotice);
+  const [messageApi, contextHolder] = message.useMessage();
+  useEffect(() => {
+    if (lastNotice) {
+      messageApi.open({ type: lastNotice.type, content: lastNotice.message });
+      dispatch(clearNotice());
+    }
+  }, [lastNotice, messageApi, dispatch]);
   return (
     <AntApp>
+      {contextHolder}
       <Layout className="shell">
-      <Header className="header">
-        <Space><SafetyCertificateOutlined style={{ fontSize: 24 }} /><Typography.Title level={4} style={{ margin: 0, color: 'white' }}>{t('title')}</Typography.Title></Space>
-        <Space><Tag>{data.length} 名值班人员</Tag><Button ghost onClick={() => void i18n.changeLanguage(i18n.language.startsWith('zh') ? 'en' : 'zh')}>{t('language')}</Button></Space>
-      </Header>
-      <Layout>
-        <Sider width={210} breakpoint="lg" collapsedWidth="0" theme="light">
-          <Menu mode="inline" selectedKeys={[location.pathname]} onClick={({ key }) => navigate(key)} items={[
-            { key: '/', label: t('control'), icon: <FlagOutlined /> },
-            { key: '/results', label: t('results'), icon: <ClockCircleOutlined /> },
-            { key: '/protests', label: t('protests'), icon: <SafetyCertificateOutlined /> }
-          ]} />
-        </Sider>
-        <Content className="content"><Routes>
-          <Route path="/" element={<ControlPage />} />
-          <Route path="/results" element={<ResultsPage />} />
-          <Route path="/protests" element={<ProtestsPage />} />
-          <Route path="*" element={<Navigate to="/" replace />} />
-        </Routes></Content>
-      </Layout>
+        <Header className="header">
+          <Space><SafetyCertificateOutlined style={{ fontSize: 24 }} /><Typography.Title level={4} style={{ margin: 0, color: 'white' }}>{t('title')}</Typography.Title></Space>
+          <Space wrap>
+            <Select value={currentOfficialId} onChange={(v) => dispatch(setCurrentOfficial(v))} style={{ width: 150 }} options={OFFICIALS.map((o) => ({ value: o.id, label: `${o.name} · ${o.role}` }))} />
+            <Tag>{data.length} 名值班人员</Tag>
+            <Button ghost onClick={() => void i18n.changeLanguage(i18n.language.startsWith('zh') ? 'en' : 'zh')}>{t('language')}</Button>
+          </Space>
+        </Header>
+        <Layout>
+          <Sider width={210} breakpoint="lg" collapsedWidth="0" theme="light">
+            <Menu mode="inline" selectedKeys={[location.pathname]} onClick={({ key }) => navigate(key)} items={[
+              { key: '/', label: t('control'), icon: <FlagOutlined /> },
+              { key: '/results', label: t('results'), icon: <ClockCircleOutlined /> },
+              { key: '/measurement', label: t('measurement'), icon: <SafetyCertificateOutlined /> },
+              { key: '/protests', label: t('protests'), icon: <SafetyCertificateOutlined /> }
+            ]} />
+          </Sider>
+          <Content className="content"><Routes>
+            <Route path="/" element={<ControlPage />} />
+            <Route path="/results" element={<ResultsPage />} />
+            <Route path="/measurement" element={<MeasurementPage />} />
+            <Route path="/protests" element={<ProtestsPage />} />
+            <Route path="*" element={<Navigate to="/" replace />} />
+          </Routes></Content>
+        </Layout>
       </Layout>
     </AntApp>
   );
